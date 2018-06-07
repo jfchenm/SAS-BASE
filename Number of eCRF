@@ -1,0 +1,185 @@
+*LIVE_AE_EFC15081 (LIVE_AE), LIVE_CE_EFC15081 (LIVE_CE), LIVE_CM_EFC15081 (LIVE_CM), LIVE_DD_EFC15081 (LIVE_DD), LIVE_DM_EFC15081 (LIVE_DM), LIVE_DS_EFC15081 (LIVE_DS), LIVE_EG_EFC15081 (LIVE_EG), LIVE_EX_EFC15081 (LIVE_EX), LIVE_FA_EFC15081 (LIVE_FA), LIVE_HP_EFC15081 (LIVE_HP), LIVE_IE_EFC15081 (LIVE_IE), LIVE_INVVAL_EFC15081 (LIVE_INVVAL), LIVE_LB_EFC15081 (LIVE_LB), LIVE_MH_EFC15081 (LIVE_MH), LIVE_NUL_EFC15081 (LIVE_NUL), LIVE_PC_EFC15081 (LIVE_PC), LIVE_PE_EFC15081 (LIVE_PE), LIVE_PR_EFC15081 (LIVE_PR), LIVE_PV_EFC15081 (LIVE_PV), LIVE_SAE_EFC15081 (LIVE_SAE), LIVE_SS_EFC15081 (LIVE_SS), LIVE_SU_EFC15081 (LIVE_SU), LIVE_SV_EFC15081 (LIVE_SV), LIVE_VS_EFC15081 (LIVE_VS)*;
+*** add for QC on WISE start ***;
+/*%let snapshot 			= 17MAR2018; *** update as per each data extraction date ***;*/
+/*%let extraction_date	= "&snapshot."d;*/
+/*%let study 				= EFC15081; *** update as per each study ***;*/
+/*%let root				= &W_ROOT./DEVOPS/&W_COMPOUND./&W_STUDY./&W_ANALYSIS./PK; *** update QC with SDTM if not for QC purpose ***;*/
+/*%let period_days		=14;*/
+/*libname data_in 		"&root./DATA";*/
+/*libname data_out 		"&root./OUTPUT";*/
+
+options mlogic mprint errorabend;
+
+%macro rename(datasetname);
+data data_in.&datasetname.; set data_in.&datasetname._&study.; run;
+%mend;
+%rename(live_sv);
+
+*** add for QC on WISE end ***;
+
+/* Extract the names of the datasets having a visit identifier and RAV_CREATE_DTM*/ 
+data datasets_visit (keep = memname);
+	set sashelp.vcolumn;
+	where (	(upcase (libname) = upcase ("data_in")) 
+			and (upcase (name) = upcase ("STUDY_EVENT_OID"))
+			and (upcase (memname) like upcase ("LIVE_%_&study."))
+/*			and (upcase (memname) like upcase ("LIVE_%"))*/
+		  )
+	;
+run;
+
+data datasets_rav_create_dtm (keep = memname);
+	set sashelp.vcolumn;
+	where (	(upcase (libname) = upcase ("data_in"))
+			and (upcase (name) = upcase ("RAV_CREATE_DTM")) 
+			and (upcase (memname) like upcase ("LIVE_%_&study."))
+/*			and (upcase (memname) like upcase ("LIVE_%"))*/
+		  )
+	;
+run;
+
+proc sort data = datasets_rav_create_dtm;
+	by memname;
+run;
+
+proc sort data = datasets_visit;
+	by memname;
+run;
+
+data datasets_ok;
+	merge datasets_visit (in=A) datasets_rav_create_dtm (in=B);
+	by memname;
+	if A and B;
+run;
+
+data _null_;
+	set datasets_ok end=last;
+	call symputx (cats ("ds_name", put (_n_, 8.)), MEMNAME, "L");	
+	if last then do;
+		call symputx ("ds_n", _n_, "L");	
+	end;
+run;
+
+/* Extract the dated subject visits */
+/* Note: The PROC SQL is used with a min VISDAT_DTM as patients may have two 
+ visits, one by phone and one on-site, with different dates */
+proc sql noprint;
+	create table sv_dated as
+		select distinct 	cp_patient, 
+							STUDY_EVENT_OID,
+							VISYN, 
+							min (visdat_dtm) as VISDAT_DTM
+		from data_in.live_sv
+		where ((visdat_dtm ne .) and (TRANSACTION_TYPE_CD ne "Remove"))
+		group by cp_patient, STUDY_EVENT_OID
+		order by cp_patient, STUDY_EVENT_OID
+	;
+quit;
+
+%macro ecrf;
+/* Loop through datasets and extract visit-related observations by inner join
+with the dated subject visits*/ 
+proc sort data = data_in.&ds_name1 (where = (TRANSACTION_TYPE_CD ne "Remove") 
+									keep = cp_patient visit cp_center cp_region 
+												STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY 
+												FORM_OID FORM_REPEAT_KEY 
+												ITEM_GROUP_OID ITEM_GROUP_REPEAT_KEY
+												RAV_CREATE_DTM
+												TRANSACTION_TYPE_CD)
+	out = &ds_name1;
+	by cp_patient STUDY_EVENT_OID;
+run;
+
+data v2ect_all;
+	merge sv_dated (in=A) &ds_name1 (in=B);
+	if A and B;
+	by cp_patient STUDY_EVENT_OID;
+run;
+
+/* ... then with the other datasets */
+%do i=2 %to &ds_n;
+	proc sort data = data_in.&&ds_name&i (where = (TRANSACTION_TYPE_CD ne "Remove")
+										  keep = cp_patient visit cp_center cp_region 
+												STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY 
+												FORM_OID FORM_REPEAT_KEY 
+												ITEM_GROUP_OID ITEM_GROUP_REPEAT_KEY
+												RAV_CREATE_DTM
+												TRANSACTION_TYPE_CD) 
+		out = tmp;
+		by cp_patient STUDY_EVENT_OID;
+	run;
+
+	data tmp;
+		merge sv_dated (in=A) tmp (in=B);
+		if A and B;
+		by cp_patient STUDY_EVENT_OID;
+	run;
+	
+	proc append base = v2ect_all data = tmp;
+	run;	
+%end;
+%mend;
+%ecrf;
+
+/* Drop specified forms , if any specified */
+	data v2ect_all;
+		set v2ect_all;
+		where (form_oid not in ("IVRS_ALL"));
+	run;
+
+/* Keep only one observation per patient-form*/
+proc sort 	data = v2ect_all
+			out = v2ect_all_1 
+			nodupkey;
+	by 	 cp_region cp_center cp_patient
+			STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY FORM_OID FORM_REPEAT_KEY
+			RAV_CREATE_DTM; 
+run; *** to exclude duplicate records of different lab test update 11JAN2018 CJF ***;
+
+data v2ect_all_2;
+	set v2ect_all_1;
+	by 	 cp_region cp_center cp_patient
+			STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY FORM_OID FORM_REPEAT_KEY
+			RAV_CREATE_DTM;
+	if first.FORM_REPEAT_KEY then output;
+run;
+
+proc sort 	data = v2ect_all_2 (drop = ITEM_GROUP_OID ITEM_GROUP_REPEAT_KEY )
+			out = v2ect_by_form 
+			nodupkey;
+	by 	 cp_region cp_center descending RAV_CREATE_DTM descending visdat_dtm 
+			descending STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY visit 
+			cp_patient FORM_OID FORM_REPEAT_KEY;
+run;
+
+data v2ect_by_form;
+	set v2ect_by_form;
+	if &extraction_date.-datepart(rav_create_dtm)+1<=&period_days. and &extraction_date.-datepart(rav_create_dtm)+1>=0 
+		and rav_create_dtm ne . then output; *** update per KRI update 11JAN2018 CJF ***;
+run;
+
+proc sql;
+	create table data_out.forms as select * from
+	((select count (*) as forms_per_center, cp_center, cp_region from v2ect_by_form
+	group by cp_center, cp_region) t1 right join
+	
+	(select count (*) as forms_per_region, cp_region from v2ect_by_form
+	group by cp_region) t2 on t1.cp_region=t2.cp_region)
+	order by cp_center, cp_region
+	;
+quit;
+
+data data_out.forms;
+	set data_out.forms;
+	study="&study.";
+run;
+
+
+
+/*%macro exp(dataset);*/
+/*proc export data=&dataset.*/
+/*	outfile="&root./OUTPUT/&study./&dataset..xls" dbms=xls replace;*/
+/*run;*/
+/*%mend;*/
+/*%exp(forms_count);*/
+
