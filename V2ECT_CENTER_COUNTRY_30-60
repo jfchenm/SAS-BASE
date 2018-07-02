@@ -1,0 +1,293 @@
+*** add for QC on WISE start ***;
+%let study 				= EFC14828; *** update as per each study ***;
+%let root				= &W_ROOT./DEVOPS/&W_COMPOUND./&W_STUDY./&W_ANALYSIS./QC; *** update QC with SDTM if not for QC purpose ***;
+libname data_in 		"&root./DATA";
+libname data_out 		"&root./OUTPUT";
+
+options mlogic mprint errorabend;
+
+%macro rename(datasetname);
+data data_in.&datasetname.; set data_in.&datasetname._&study.; run;
+%mend;
+%rename(live_sv);
+
+*** add for QC on WISE end ***;
+
+%macro V2ECT (	drop_forms = ,
+				ppc_forms = ,
+				min_forms_n = ,
+				max_forms_n = ,
+				analysis_by_var = );
+
+/*******************************************************************************
+Author: 			Anne-Sophie Gathy
+Creation date:		20-MAR-2017
+
+Parameters:	
+drop_forms =	List of quoted, comma-separated FORM_OIDs to exclude from the 
+				KRI (ex: automatic forms).
+ppc_forms =		Library.Dataset describing the post-production changes of the eCRF
+min_forms_n	=	Minimal number of forms for an entity to be included in the output dataset
+max_forms_n = 	Maximal number of forms per entity to keep in the output dataset
+analysis_by_var=entity level at which the analysis will run (cp_region or cp_center)
+*******************************************************************************/
+
+%if %length (&min_forms_n) = 0 %then %do;
+	%put ERROR: min_forms_n is not specified;
+	%goto exit;
+%end;
+%if %length (&max_forms_n) = 0 %then %do;
+	%put ERROR: max_forms_n is not specified;
+	%goto exit;
+%end;
+%if %length (&analysis_by_var) = 0 %then %do;
+	%put ERROR: analysis_by_var is not specified;
+	%goto exit;
+%end;
+%if ((%upcase ("&analysis_by_var") ne "CP_CENTER") and (%upcase ("&analysis_by_var") ne "CP_REGION")) %then %do;
+	%put ERROR: analysis_by_var should be either CP_CENTER or CP_REGION;
+	%goto exit;
+%end;
+
+%let drop_forms = %trim (%upcase (&drop_forms));
+
+/* Extract the names of the datasets having a visit identifier and RAV_CREATE_DTM*/ 
+data datasets_visit (keep = memname);
+	set sashelp.vcolumn;
+	where (	(upcase (libname) = upcase ("data_in")) 
+			and (upcase (name) = upcase ("STUDY_EVENT_OID"))
+			and (upcase (memname) like upcase ("LIVE_%"))
+/*			and (upcase (memname) like upcase ("LIVE_%"))*/
+		  )
+	;
+run;
+
+data datasets_rav_create_dtm (keep = memname);
+	set sashelp.vcolumn;
+	where (	(upcase (libname) = upcase ("data_in"))
+			and (upcase (name) = upcase ("RAV_CREATE_DTM")) 
+			and (upcase (memname) like upcase ("LIVE_%"))
+/*			and (upcase (memname) like upcase ("LIVE_%"))*/
+		  )
+	;
+run;
+
+proc sort data = datasets_rav_create_dtm;
+	by memname;
+run;
+
+proc sort data = datasets_visit;
+	by memname;
+run;
+
+data datasets_ok;
+	merge datasets_visit (in=A) datasets_rav_create_dtm (in=B);
+	by memname;
+	if A and B;
+run;
+
+data _null_;
+	set datasets_ok end=last;
+	call symputx (cats ("ds_name", put (_n_, 8.)), MEMNAME, "L");	
+	if last then do;
+		call symputx ("ds_n", _n_, "L");	
+	end;
+run;
+
+/* Extract the dated subject visits */
+/* Note: The PROC SQL is used with a min VISDAT_DTM as patients may have two 
+ visits, one by phone and one on-site, with different dates */
+proc sql noprint;
+	create table sv_dated as
+		select distinct 	cp_patient, 
+							STUDY_EVENT_OID,
+							VISYN, 
+							min (visdat_dtm) as VISDAT_DTM
+		from data_in.live_sv
+		where ((visdat_dtm ne .) and (TRANSACTION_TYPE_CD ne "Remove"))
+		group by cp_patient, STUDY_EVENT_OID
+		order by cp_patient, STUDY_EVENT_OID
+	;
+quit;
+
+/* Loop through datasets and extract visit-related observations by inner join
+with the dated subject visits*/ 
+proc sort data = data_in.&ds_name1 (where = (TRANSACTION_TYPE_CD ne "Remove") 
+									keep = cp_patient visit cp_center cp_region 
+												STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY 
+												FORM_OID FORM_REPEAT_KEY 
+												ITEM_GROUP_OID ITEM_GROUP_REPEAT_KEY
+												RAV_CREATE_DTM
+												TRANSACTION_TYPE_CD)
+	out = &ds_name1;
+	by cp_patient STUDY_EVENT_OID;
+run;
+
+data v2ect_all;
+	merge sv_dated (in=A) &ds_name1 (in=B);
+	if A and B;
+	by cp_patient STUDY_EVENT_OID;
+run;
+
+/* ... then with the other datasets */
+%do i=2 %to &ds_n;
+	proc sort data = data_in.&&ds_name&i (where = (TRANSACTION_TYPE_CD ne "Remove")
+										  keep = cp_patient visit cp_center cp_region 
+												STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY 
+												FORM_OID FORM_REPEAT_KEY 
+												ITEM_GROUP_OID ITEM_GROUP_REPEAT_KEY
+												RAV_CREATE_DTM
+												TRANSACTION_TYPE_CD) 
+		out = tmp;
+		by cp_patient STUDY_EVENT_OID;
+	run;
+
+	data tmp;
+		merge sv_dated (in=A) tmp (in=B);
+		if A and B;
+		by cp_patient STUDY_EVENT_OID;
+	run;
+	
+	proc append base = v2ect_all data = tmp;
+	run;	
+%end;
+
+
+/* Drop specified forms , if any specified */
+%if (%length (&drop_forms) ne 0) %then %do;
+	data v2ect_all;
+		set v2ect_all;
+		where (form_oid not in (&drop_forms));
+	run;
+%end;
+
+proc sort 	data = v2ect_all
+			out = v2ect_all_1 
+			nodupkey;
+	by 	 cp_region cp_center cp_patient
+			STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY FORM_OID FORM_REPEAT_KEY
+			RAV_CREATE_DTM;
+run;
+
+data v2ect_all_2;
+	set v2ect_all_1;
+	by 	 cp_region cp_center cp_patient
+			STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY FORM_OID FORM_REPEAT_KEY
+			RAV_CREATE_DTM;
+	if first.FORM_REPEAT_KEY then output;
+run;
+
+proc sort 	data = v2ect_all_2 (drop = ITEM_GROUP_OID ITEM_GROUP_REPEAT_KEY )
+			out = v2ect_by_form 
+			nodupkey;
+	by 	 cp_region cp_center descending RAV_CREATE_DTM descending visdat_dtm 
+			descending STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY visit 
+			cp_patient FORM_OID FORM_REPEAT_KEY;
+run;
+*** update per QC findings end ***;
+
+/* Convert date-times to dates */
+data v2ect_by_form;
+	set v2ect_by_form(where=(RAV_CREATE_DTM ne .));
+	format	VISDAT_DTM date9.;
+/*			RAV_CREATE_DTM date9.;*/
+	VISDAT_DTM = datepart (visdat_dtm);
+/*	RAV_CREATE_DTM = datepart (RAV_CREATE_DTM);*/
+run;	
+
+
+/* Take into account post-production changes in the eCRF, if any specified */
+%if (%length (&ppc_forms) ne 0) %then %do;
+	proc sort data = V2ECT_BY_FORM;
+		by form_oid study_event_oid;
+	run;
+	data V2ECT_BY_FORM (drop = release_date);
+		merge V2ECT_BY_FORM (in=A) &ppc_forms (in=B keep = form_oid study_event_oid release_date);
+		by form_oid study_event_oid;
+		if A; 
+		if (VISDAT_DTM < release_date) then VISDAT_DTM = release_date;
+	run;
+%end;
+
+data v2ect_by_form;
+	set v2ect_by_form;
+	/* Compute the no. days between the visit date and the date of 1st data entry of each patient-form.*/
+	V2EDAYS = intck ('day', visdat_dtm, datepart(RAV_CREATE_DTM))+1;
+	/* If the no. days is negative, set it to null */
+	if (V2EDAYS ne .) then do;
+		if (V2EDAYS < 1) then do;
+			V2EDAYS = .;
+			V2EDAYS_NEGYN = "Yes";
+		end;
+	end;
+run;
+
+
+/* Keep only entities with at least &min_forms_n patient-forms,
+and keep only the last &max_forms_n patient-forms of those entities. */ 
+proc sql noprint; 
+	/* count no. patient-forms per entity */
+	create table forms_count as 
+	select count (*) as count_form, &analysis_by_var
+	from v2ect_by_form
+	group by &analysis_by_var
+	;
+	/* select IDS of entities with enough patient-forms */
+	select &analysis_by_var into :ok_entities separated by '" "'
+	from forms_count
+	where (count_form >= &min_forms_n)
+	;
+quit;
+
+proc sort data = v2ect_by_form;
+	by &analysis_by_var descending RAV_CREATE_DTM ;
+run;
+
+data v2ect_by_form_minmax (drop = count);
+	set v2ect_by_form (where = (&analysis_by_var in ("&ok_entities")));
+	by &analysis_by_var;
+	if first.&analysis_by_var then do;
+		count = 1;
+	end;
+	else do;
+		count + 1;
+	end;
+	if count <= &max_forms_n then output;
+run;
+
+
+/* Output final datasets, sorted by cp_patient and visdat */
+proc sort data = v2ect_by_form_minmax;
+	by cp_region cp_center cp_patient DESCENDING visdat_dtm;
+run;
+
+data data_out.output;
+	retain cp_region cp_center cp_patient 
+		STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY visit VISYN visdat_dtm TRANSACTION_TYPE_CD 
+		FORM_OID FORM_REPEAT_KEY RAV_CREATE_DTM	V2EDAYS	V2EDAYS_NEGYN;
+	set v2ect_by_form_minmax;
+run;
+
+%exit:
+%mend V2ECT;
+
+options mprint mlogic;
+
+%V2ECT (	drop_forms = %quote ("IVRS_ALL"),
+			ppc_forms =, /* no post-production change reported by RBM CM so far */
+			min_forms_n = 30,
+			max_forms_n = 60,
+			analysis_by_var = CP_CENTER
+			);
+      
+%macro exp(dataset);
+data data_out.&dataset.;
+	set data_out.output;
+run;
+
+proc export data=data_out.&dataset.
+	outfile="&root./OUTPUT/&dataset..xls" dbms=xls replace;
+run;
+%mend;
+%exp(v2ect_center_qc);
+%exp(v2ect_country_qc);
