@@ -1,0 +1,196 @@
+*** add for QC on WISE start ***;
+%let study 			    = EFC15246; *** update as per each study ***;
+%let root			      = &W_ROOT./DEVOPS/&W_COMPOUND./&W_STUDY./&W_ANALYSIS./REPORT; *** update QC with SDTM if not for QC purpose ***;
+libname data_in 		"&root./DATA";
+libname data_out 		"&root./OUTPUT";
+
+options mlogic mprint errorabend;
+
+%macro rename(datasetname);
+data data_in.&datasetname.; set data_in.&datasetname._&study.; run;
+%mend;
+%rename(ctms_subject);
+%rename(ctms_milestone);
+%rename(live_sub);
+%rename(live_ivrs);
+*** add for QC on WISE end ***;
+
+%let period_days 		= 30;
+
+*** get extraction date START ***;
+proc sql noprint;
+	select distinct snapshot into :snapshot from data_in.sds;
+quit;
+
+%put &snapshot.;
+%let extraction_date	= "&snapshot."d;
+*** get extraction date END ***;
+
+%macro impact_siteid_country (indsnam =);
+	/* Add center and country information in IMPACT site-level datasets */
+	proc sort data = data_in.&indsnam 
+		out = &indsnam;
+		by COUNTRY_C STUDY_SITE_NO;
+	run;
+	proc sort data = data_in.ctms_subject (where = (cp_center ne "") keep = COUNTRY_C STUDY_SITE_NO cp_region cp_center) 
+		out = ctms_subject
+		nodupkey; *** add where clause to avoid bugs updated by CJF 02JAN2018 ***;
+		by COUNTRY_C STUDY_SITE_NO;
+	run;	
+	data &indsnam;
+		merge ctms_subject (in=A) &indsnam (in=B);
+		by COUNTRY_C STUDY_SITE_NO;
+		if B;
+	run;
+%mend impact_siteid_country;
+
+%impact_siteid_country (indsnam = ctms_milestone);
+
+
+%macro ENRAT ();	
+	/*******************************************************************************
+	Author: 			Anne-Sophie Gathy
+	Creation date:		16-MAR-2017
+	
+	Description: This macro computes the enrollment rate per site over the last XX days.
+	
+	Parameters:
+	period_days	=	Number of days before today's date to compute the enrollment rate
+	*******************************************************************************/
+		
+	%if %length (&period_days) = 0 %then %do;
+		%put NOTE: period_days is not specified, so the time since SIV will be used;
+	%end;
+
+	/* Compute DURATION = no days since SIV for each site */
+	data SIV_DATES (keep = cp_center SIV_DATE DURATION);
+		set CTMS_MILESTONE;
+		where 	(MILESTONE_L ="Site Initiation Visit(SIV)") and 
+				(MILESTONE_TYPE_C = "ACTUAL") and 
+				(MILESTONE_START_D ne .);
+		extraction_date = &extraction_date.;
+		format extraction_date date11.;
+		DURATION = extraction_date - datepart (MILESTONE_START_D)+1;
+		label DURATION = "No. days between data extraction date and the SIV";
+		%if (%length (&period_days) ne 0) %then %do;
+			if (DURATION > &period_days) then DURATION = &period_days;
+		%end;
+		rename MILESTONE_START_D = SIV_DATE; 
+		format MILESTONE_START_D datetime.;
+	run;
+	
+	/* Only centers having at least one patient must be included in the final dataset;
+	each site's observations will be assigned to its first patient */
+	proc sort data = data_in.live_sub (where =(TRANSACTION_TYPE_CD ne "Remove")) 
+				out = ACTIVE_SITES (keep = cp_region cp_center cp_patient);
+		by cp_center cp_patient;
+	run;
+
+	proc sort data = ACTIVE_SITES out= ACTIVE_SITES nodupkey;
+		by cp_center;
+	run;
+
+	proc sort data = SIV_DATES;
+		by cp_center;
+	run;
+	
+	data ACTIVE_SITES;
+		merge	ACTIVE_SITES (in=inA)
+				SIV_DATES (in=inB);
+		by cp_center;
+		if inA and inB;
+	run;		 
+	
+	/* Compute total no of events (in all OR in the specified period) for each site having at least one event */
+	proc sql noprint;
+		create table ivrs as
+		select t1.cp_region, t1.cp_center, t1.cp_patient, t1.DSSTDAT, t1.DSSTDAT_DTM, t2.* from data_in.live_ivrs t1
+			left join active_sites t2 on t1.cp_center=t2.cp_center
+		where t1.TRANSACTION_TYPE_CD ne "Remove" and t1.DSSTDAT ne "";
+	quit;
+	
+	proc sql noprint;
+		create table CNT as
+		select distinct count (distinct cp_patient) as EVENT_CNT label = "No. enrolled patients", 
+			cp_center, cp_region, duration, SIV_DATE
+		from ivrs 
+		where DSSTDAT ne ""
+				%if (%length (&period_days) ne 0) %then %do;
+				and (&extraction_date. - datepart (DSSTDAT_DTM))+1 <= DURATION
+				%end;
+		group by cp_center
+		order by cp_center;
+	quit;
+	
+	/* Merge DURATION and EVENT_CNT info for each site */
+	data ACTIVE_SITES_CNT;
+		merge 	ACTIVE_SITES (in=inA)
+				CNT (in=inB) ;
+		by cp_center;
+		if inA;
+		if EVENT_CNT = . then EVENT_CNT = 0;
+		extraction_date = &extraction_date.;
+		format extraction_date date11.;
+	run;
+	
+	/* Extend the dataset: no. observations per site = site's DURATION */
+	data ACTIVE_SITES_CNT_EXT (drop=tmpseq);
+		set ACTIVE_SITES_CNT;
+		by cp_center;
+		if first.cp_center then do;
+			tmpseq = 1;
+			do while (tmpseq <= DURATION);
+				output;
+				tmpseq+1;
+			end;
+		end;
+	run;
+	
+	/* Only the site's first observation carries the true value of EVENT_CNT, 
+	the site's remaining observations are set to 0 */
+	data data_out.output;
+		set ACTIVE_SITES_CNT_EXT;
+		by cp_center;
+		if first.cp_center  = 0 then do;
+			EVENT_CNT = 0;
+		end;
+	run;	
+
+	proc sort data=data_out.output; by cp_region cp_center; run; 
+
+	data a;
+		set data_out.output;
+		by cp_region;
+		if first.cp_region=1 then CNT=0;
+		CNT+EVENT_CNT;
+	run;
+
+	data b;
+		set a;
+		by cp_region;
+		if last.cp_region=0 then CNT=0;
+	run;
+
+	data data_out.output(where=(cp_patient ne ""));
+		retain cp_center cp_region SIV_DATE extraction_date duration EVENT_CNT;
+		set b;
+		EVENT_CNT_=CNT;
+		drop EVENT_CNT CNT;
+		rename EVENT_CNT_=EVENT_CNT;
+	run;
+
+%mend ENRAT;
+
+%ENRAT;	
+
+*** for QC ***;
+%macro exp(dataset);
+data data_out.&dataset.;
+	set data_out.output;
+run;
+
+proc export data=data_out.&dataset.
+	outfile="&root./OUTPUT/&dataset..xls" dbms=xls replace;
+run;
+%mend;
+%exp(enrat_country_qc);
