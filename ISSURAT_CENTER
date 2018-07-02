@@ -1,0 +1,139 @@
+*** add for QC on WISE start ***;
+%let study 				= EFC14828; *** update as per each study ***;
+%let root				= &W_ROOT./DEVOPS/&W_COMPOUND./&W_STUDY./&W_ANALYSIS./QC; *** update QC with SDTM if not for QC purpose ***;
+libname data_in 		"&root./DATA";
+libname data_out 		"&root./OUTPUT";
+
+options mlogic mprint errorabend;
+
+%macro rename(datasetname);
+data data_in.&datasetname.; set data_in.&datasetname._&study.; run;
+%mend;
+%rename(ctms_subject);
+%rename(ctms_issue);
+%rename(ctms_milestone);
+%rename(live_sub);
+*** add for QC on WISE end ***;
+
+proc sql noprint;
+	select distinct snapshot into :snapshot from data_in.sds;
+quit;
+
+%put &snapshot.;
+%let extraction_date	= "&snapshot."d;
+
+%macro impact_siteid_country (indsnam =);
+	proc sort data = data_in.&indsnam 
+		out = &indsnam;
+		by COUNTRY_C STUDY_SITE_NO;
+	run;
+	proc sort data = data_in.ctms_subject (where = (cp_center ne "") keep = COUNTRY_C STUDY_SITE_NO cp_region cp_center) 
+		out = ctms_subject
+		nodupkey;
+		by COUNTRY_C STUDY_SITE_NO;
+	run;	
+	data &indsnam;
+		merge ctms_subject (in=A) &indsnam (in=B);
+		by COUNTRY_C STUDY_SITE_NO;
+		if B;
+	run;
+%mend impact_siteid_country;
+
+%impact_siteid_country (indsnam = ctms_issue);
+%impact_siteid_country (indsnam = ctms_milestone);
+
+
+/* Only centers having at least one patient must be included in the final dataset;
+each site's observations will be assigned to its first patient */
+proc sort 	data = data_in.live_sub (where = (TRANSACTION_TYPE_CD ne "Remove"))
+			out = output (keep = cp_region cp_center cp_patient);
+	by cp_center cp_patient;
+run;
+
+*proc sort data = output out = output(drop=cp_patient) nodupkey;*** UPDATE CJF: should drop cp_patient var***;
+proc sort data = output out = output nodupkey;
+	by cp_center;
+run;
+
+/* Compute DURATION = no days since SIV for each site */
+data SIV_DATES (keep = cp_center MILESTONE_START_D DURATION extraction_date);
+	set CTMS_MILESTONE;
+	where 	(MILESTONE_L ="Site Initiation Visit(SIV)") and 
+			(MILESTONE_TYPE_C = "ACTUAL") and 
+			(MILESTONE_START_D ne .) and
+			(LEVEL_C = "STUDY SITE");
+	*CURRENT_DATE = today();*** UPDATE CJF: shoulbe change into database extraction date ***;
+	extraction_date = &extraction_date.;*** UPDATE CJF: shoulbe change into database extraction date ***;
+	format extraction_date date11.;
+	DURATION = extraction_date - datepart (MILESTONE_START_D)+1;
+run;
+
+proc sort data = SIV_DATES;
+	by cp_center;
+run;
+
+data output;
+	merge	output (in=inA)
+			SIV_DATES (in=inB);
+	by cp_center;
+	if inA and inB;
+run;		 
+
+/* Compute total no of issues per site (having at least one event) */
+proc sql noprint;
+	create table ISSUE_CNT as
+	select count (distinct ISSUE_NO) as EVENT_CNT, cp_center
+	from ctms_issue
+	where 	(ISSUE_ESCALATION_FLAG="Y") 
+	group by cp_center;
+quit;
+
+/* Merge DURATION and EVENT_CNT info for each site */
+data output;
+	merge 	output (in=inA)
+			ISSUE_CNT (in=inB) ;
+	by cp_center;
+	rename MILESTONE_START_D = SIV_DATE; 
+	if EVENT_CNT = . then EVENT_CNT = 0;
+	if inA;
+run;
+
+
+/* Extend the dataset: no. observations per site = site's DURATION */
+data output (drop=tmpseq);
+	set output;
+	by cp_center;
+	if first.cp_center then do;
+		tmpseq = 1;
+		do while (tmpseq <= DURATION);
+			output;
+			tmpseq+1;
+		end;
+	end;
+run;
+
+/* Only the site's first observation carries the true value of EVENT_CNT, 
+the site's remaining observations are set to 0 */
+data data_out.output;
+	set output;
+	by cp_center;
+	if first.cp_center  = 0 then do;
+		EVENT_CNT = 0;
+	end;
+run;
+
+data data_out.output(where=(cp_patient ne ""));
+	retain cp_center cp_region SIV_DATE extraction_date duration EVENT_CNT;
+	set data_out.output;
+run;
+
+%macro exp(dataset);
+data data_out.&dataset.;
+	set data_out.output;
+run;
+
+proc export data=data_out.&dataset.
+	outfile="&root./OUTPUT/&dataset..xls" dbms=xls replace;
+run;
+%mend;
+%exp(issurat_center_qc);
