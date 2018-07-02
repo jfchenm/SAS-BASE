@@ -1,0 +1,211 @@
+*** add for QC on WISE start ***;
+%let study 				  = EFC14828; *** update as per each study ***;
+%let root				    = &W_ROOT./DEVOPS/&W_COMPOUND./&W_STUDY./&W_ANALYSIS./QC; *** update QC with SDTM if not for QC purpose ***;
+libname data_in 		"&root./DATA";
+libname data_out 		"&root./OUTPUT";
+
+options mlogic mprint errorabend;
+
+data data_in.QUERIES; set data_in.RVOD_QUERIES_&study.;
+	cp_patient=subjid;
+	cp_center=substr(subjid,1,7);
+	cp_region1=substr(subjid,1,3);
+run;
+
+proc sort data=data_in.QUERIES; by cp_region1; run;
+
+data data_in.QUERIES;
+	merge data_in.QUERIES(in=in1) data_in.cp_region(in=in2);
+	by cp_region1;
+	if in1 then output;
+	drop cp_region1;
+run;
+*** add for QC on WISE end ***;
+
+options mlogic;
+
+/* Define the combination of RAVE  variables to identify uniquely an item_group and a form */
+%let item_group_keys = cp_region cp_center cp_patient STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY 
+				FORM_OID FORM_REPEAT_KEY ITEM_GROUP_OID ITEM_GROUP_REPEAT_KEY;
+%let min_datapoints = 300;
+%let max_datapoints = 1000;
+%let analysis_by_var = cp_center;
+
+/* Get the number and names dataset of the RAVE clinical datasets */
+data _null_;
+	set sashelp.vtable end=last;
+	where libname = "DATA_IN" and memname like 'LIVE%';
+	call symputx (cats ("ds_name", put (_n_, 8.)), MEMNAME, "L");	
+	if last then do;
+		call symputx ("ds_n", _n_, "L");	
+	end;
+run;
+
+/* Transform the whole RAVE clinical DB -> 1 row per datapoint */ 
+%macro transpose_db;
+	proc sort data = data_in.&ds_name1
+		out = tmp
+		nodupkey;
+		by &item_group_keys rav_create_dtm;
+	run;
+	
+	proc transpose data = tmp out = alldatapoints (keep =&item_group_keys rav_create_dtm _name_ 
+											rename = (_name_ = ITEM_OID)
+											where = (cp_patient is not null));
+		by &item_group_keys rav_create_dtm;
+		var _numeric_ _character_;
+	run;
+
+	data alldatapoints;
+		length item_oid $ 100;
+		set alldatapoints;
+	run;
+	
+	%do i = 2 %to &ds_n;
+		proc sort data = data_in.&&ds_name&i (where = (cp_patient is not null))
+			out = tmp
+			nodupkey;
+			by &item_group_keys rav_create_dtm;
+		run;
+		
+		proc transpose data = tmp out = tmp_tra (keep =&item_group_keys rav_create_dtm _name_ 
+												rename = (_name_ = ITEM_OID)
+												where = (cp_patient is not null));
+			by &item_group_keys rav_create_dtm;
+			var _numeric_ _character_;
+		run;
+		
+		data tmp_tra;
+			length item_oid $ 100;
+			set tmp_tra;
+		run;	
+		
+		proc append base = alldatapoints data = tmp_tra;
+		run;
+	%end;
+%mend transpose_db;
+%transpose_db;
+
+/* Select the most recent datapoints for entities having a sufficient number of datapoints */
+proc sql;
+	create table alldatapoints_submit as 
+	select t1.*, t2.* from alldatapoints t1 inner join data_in.sds t2 
+	on t1.form_oid=t2.form_oid and t1.item_oid=t2.item_oid
+	where rav_create_dtm ne .
+	;
+quit;
+
+*** lbtest for lb domain ***;
+data lb;
+	set data_in.live_lb;
+	if form_oid in ("LB_LC_01_01","LB_LC_ADD_01_01") then LBSRTEST="";
+	keep &item_group_keys rav_create_dtm form_oid LBSRTEST;
+run;
+
+proc sort data=lb; by form_oid LBSRTEST; run;
+
+data sds_lb;
+	set data_in.sds(where=(LBSRTEST ne ""));
+	if form_oid in ("LB_LC_01_01","LB_LC_ADD_01_01") then LBSRTEST="";
+run;
+
+proc sort data=sds_lb; by form_oid LBSRTEST; run;
+
+data alldatapoints_lbtest;
+	merge lb(in=in1) sds_lb(in=in2);
+	by form_oid LBSRTEST;
+	if in1 and in2 and rav_create_dtm ne .;
+run;
+
+data alldatapoints; 
+	set alldatapoints_submit alldatapoints_lbtest; 
+	if IsLog="FALSE" then ITEM_GROUP_REPEAT_KEY="0";
+run;
+
+proc sort data=alldatapoints nodupkey; *** to avoid duplicate obs ***;
+		by &item_group_keys ITEM_OID;
+run;
+
+proc sql;
+	create table count_datapoints as 
+	select count (*) as total_datapoints_per_entity, &analysis_by_var
+	from alldatapoints
+	group by &analysis_by_var;
+	
+	select distinct &analysis_by_var into :ok_entities separated by '" "'
+	from count_datapoints
+	where total_datapoints_per_entity >= &min_datapoints;
+quit;
+
+proc sort data = alldatapoints;
+	by &analysis_by_var descending RAV_CREATE_DTM;
+run;
+
+data recentdatapoints (drop = count);
+	set alldatapoints (where = (&analysis_by_var in ("&ok_entities")));
+	by &analysis_by_var;
+	if first.&analysis_by_var then do;
+		count = 1;
+	end;
+	else do;
+		count + 1;
+	end;
+	if count <= &max_datapoints then output;
+run;
+	
+/* Keep queries of interest */	
+data aqr_keep_queries;
+	set data_in.queries;
+	where lowcase(query_opened_by) = "systemuser" and (cp_patient is not null);
+	if QUERY_CANCELLED_DTM ne . then delete;
+	if lowcase(query_opened_by)="systemuser" AND trim(query_txt)="The field is required. Please complete." then delete;
+run;
+
+/* Merge queries and datapoints information */
+proc sort data = aqr_keep_queries  (keep=	&item_group_keys 
+											ITEM_OID 
+											query_id);
+	by &item_group_keys ITEM_OID;
+run;
+
+proc sort data = recentdatapoints;
+	by &item_group_keys ITEM_OID;
+run;
+
+data recentdatapoints_queries;
+	merge recentdatapoints (in=A) aqr_keep_queries (in=B);
+	by &item_group_keys ITEM_OID;
+	if A; /* NB: some queries come from records having the 'Remove' status: 
+			those queries are not kept in the KRI */
+run;
+
+/* Count number of queries per datapoint */
+proc sql noprint;
+	create table recentdatapoints_queries_count as
+	select cp_region, cp_center, cp_patient, STUDY_EVENT_OID, STUDY_EVENT_REPEAT_KEY,
+				FORM_OID, FORM_REPEAT_KEY, ITEM_GROUP_OID, ITEM_GROUP_REPEAT_KEY,
+				RAV_CREATE_DTM, item_oid, 
+				count (query_id) as countQueryDatapoint
+	from recentdatapoints_queries
+	group by 	cp_region, cp_center, cp_patient, STUDY_EVENT_OID, STUDY_EVENT_REPEAT_KEY,
+				FORM_OID, FORM_REPEAT_KEY, ITEM_GROUP_OID, ITEM_GROUP_REPEAT_KEY,
+				RAV_CREATE_DTM, item_oid;
+quit;
+
+/* Output */
+data data_out.output;
+	set recentdatapoints_queries_count;
+run;
+
+*** for QC ***;
+%macro exp(dataset);
+data data_out.&dataset.;
+	set data_out.output;
+run;
+
+proc export data=data_out.&dataset.
+	outfile="&root./OUTPUT/&dataset..xls" dbms=xls replace;
+run;
+%mend;
+%exp(aqrat_center_qc);
+%exp(aqrat_country_qc);
