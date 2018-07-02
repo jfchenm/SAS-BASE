@@ -1,6 +1,6 @@
 *** add for QC on WISE start ***;
-%let study 				= EFC15246; *** update as per each study ***;
-%let root				= &W_ROOT./DEVOPS/&W_COMPOUND./&W_STUDY./&W_ANALYSIS./REPORT; *** update QC with SDTM if not for QC purpose ***;
+%let study 			= EFC15246; *** update as per each study ***;
+%let root			= &W_ROOT./DEVOPS/&W_COMPOUND./&W_STUDY./&W_ANALYSIS./REPORT; *** update QC with SDTM if not for QC purpose ***;
 libname data_in 		"&root./DATA";
 libname data_out 		"&root./OUTPUT";
 
@@ -15,6 +15,8 @@ data data_in.&datasetname.; set data_in.&datasetname._&study.; run;
 %rename(live_ivrs);
 *** add for QC on WISE end ***;
 
+%let period_days 		= 30;
+
 *** get extraction date START ***;
 proc sql noprint;
 	select distinct snapshot into :snapshot from data_in.sds;
@@ -23,8 +25,6 @@ quit;
 %put &snapshot.;
 %let extraction_date	= "&snapshot."d;
 *** get extraction date END ***;
-
-%let period_days 		= 30;
 
 %macro impact_siteid_country (indsnam =);
 	/* Add center and country information in IMPACT site-level datasets */
