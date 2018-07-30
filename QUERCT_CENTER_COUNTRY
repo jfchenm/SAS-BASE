@@ -1,5 +1,5 @@
 *** add for QC on WISE start ***;
-%let study 				= EFC15246; *** update as per each study ***;
+%let study 				= EFC14828; *** update as per each study ***;
 %let root				  = &W_ROOT./DEVOPS/&W_COMPOUND./&W_STUDY./&W_ANALYSIS./QC; *** update QC with SDTM if not for QC purpose ***;
 libname data_in 		"&root./DATA";
 libname data_out 		"&root./OUTPUT";
@@ -227,8 +227,8 @@ run;
 
 data data_out.output;* (drop = count);
 	set querct_keep_queries (where = (&analysis_by_var in ("&ok_entities")));
-	keep CP_CENTER CP_REGION cp_patient form_oid FORM_REPEAT_KEY item_oid ITEM_GROUP_REPEAT_KEY query_txt query_status_nm query_opened_dtm query_closed_dtm  query_response_dtm  
-		EFFECTIVE_QUERY_RESPONSE_DTM maRking_group_nm CT_DAYS;
+	keep CP_CENTER CP_REGION cp_patient form_oid FORM_REPEAT_KEY item_oid ITEM_GROUP_REPEAT_KEY query_txt query_status_nm query_opened_dtm query_closed_dtm query_response_dtm  
+		EFFECTIVE_QUERY_RESPONSE_DTM maRking_group_nm CT_DAYS instance_nm datapage_nm field_label item_value answer_txt;
 run;
 
 %exit:
@@ -243,7 +243,8 @@ run;
 						   )  
 					  ,
 		analysis_by_var = cp_center
-		); *** analysis_by_var = cp_region for country level analysis ***;
+		analysis_by_var = cp_region
+); *** analysis_by_var = cp_region for country level analysis ***;
    
 %macro exp(dataset);
 data data_out.&dataset.;
@@ -254,6 +255,5 @@ proc export data=data_out.&dataset.
 	outfile="&root./OUTPUT/&dataset..xls" dbms=xls replace;
 run;
 %mend;
-%exp(querct_center_qc);
-%exp(querct_country_qc); 
-    
+%exp(querct_s_qc);
+%exp(querct_c_qc); 
