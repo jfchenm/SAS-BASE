@@ -1,0 +1,259 @@
+*** add for QC on WISE start ***;
+%let study 				= EFC14828; *** update as per each study ***;
+%let root				  = &W_ROOT./DEVOPS/&W_COMPOUND./&W_STUDY./&W_ANALYSIS./QC; *** update QC with SDTM if not for QC purpose ***;
+libname data_in 		"&root./DATA";
+libname data_out 		"&root./OUTPUT";
+
+options mlogic mprint errorabend;
+
+data data_in.QUERIES; set data_in.RVOD_QUERIES_&study.;
+	cp_patient=subjid;
+	cp_center=substr(subjid,1,7);
+	cp_region1=substr(subjid,1,3);
+run;
+
+proc sort data=data_in.QUERIES; by cp_region1; run;
+
+data data_in.QUERIES;
+	merge data_in.QUERIES(in=in1) data_in.cp_region(in=in2);
+	by cp_region1;
+	if in1 then output;
+	drop cp_region1;
+run;
+*** add for QC on WISE end ***;
+
+proc sql noprint;
+	select distinct snapshot into :snapshot from data_in.sds;
+quit;
+
+%put &snapshot.;
+%let extraction_date	= "&snapshot."d;
+
+*** add to keep active queries from active datapoints START ***;
+%let item_group_keys 	= cp_region cp_center cp_patient STUDY_EVENT_OID STUDY_EVENT_REPEAT_KEY 
+				FORM_OID FORM_REPEAT_KEY ITEM_GROUP_OID ITEM_GROUP_REPEAT_KEY;
+				
+/* Get the number and names dataset of the RAVE clinical datasets */
+data _null_;
+	set sashelp.vtable end=last;
+	where libname = "DATA_IN" and memname like 'LIVE%';
+	call symputx (cats ("ds_name", put (_n_, 8.)), MEMNAME, "L");	
+	if last then do;
+		call symputx ("ds_n", _n_, "L");	
+	end;
+run;
+
+/* Transform the whole RAVE clinical DB -> 1 row per datapoint */ 
+%macro transpose_db;
+	proc sort data = data_in.&ds_name1
+		out = tmp
+		nodupkey;
+		by &item_group_keys rav_create_dtm;
+	run;
+	
+	proc transpose data = tmp out = alldatapoints (keep =&item_group_keys rav_create_dtm _name_ 
+											rename = (_name_ = ITEM_OID)
+											where = (cp_patient is not null));
+		by &item_group_keys rav_create_dtm;
+		var _numeric_ _character_;
+	run;
+
+	data alldatapoints;
+		length item_oid $ 100;
+		set alldatapoints;
+	run;
+	
+	%do i = 2 %to &ds_n;
+		proc sort data = data_in.&&ds_name&i (where = (cp_patient is not null))
+			out = tmp
+			nodupkey;
+			by &item_group_keys rav_create_dtm;
+		run;
+		
+		proc transpose data = tmp out = tmp_tra (keep =&item_group_keys rav_create_dtm _name_ 
+												rename = (_name_ = ITEM_OID)
+												where = (cp_patient is not null));
+			by &item_group_keys rav_create_dtm;
+			var _numeric_ _character_;
+		run;
+		
+		data tmp_tra;
+			length item_oid $ 100;
+			set tmp_tra;
+		run;	
+		
+		proc append base = alldatapoints data = tmp_tra;
+		run;
+	%end;
+%mend transpose_db;
+%transpose_db;
+
+/* Select the most recent datapoints for entities having a sufficient number of datapoints */
+proc sql;
+	create table alldatapoints_submit as 
+	select t1.*, t2.* from alldatapoints t1 inner join data_in.sds t2 
+	on t1.form_oid=t2.form_oid and t1.item_oid=t2.item_oid
+/*	where rav_create_dtm ne .*/
+	;
+quit;
+
+*** lbtest for lb domain ***;
+data lb;
+	set data_in.live_lb;
+	if form_oid in ("LB_LC_01_01","LB_LC_ADD_01_01") then LBSRTEST="";
+	keep &item_group_keys rav_create_dtm form_oid LBSRTEST;
+run;
+
+proc sort data=lb; by form_oid LBSRTEST; run;
+
+data sds_lb;
+	set data_in.sds(where=(LBSRTEST ne ""));
+	if form_oid in ("LB_LC_01_01","LB_LC_ADD_01_01") then LBSRTEST="";
+run;
+
+proc sort data=sds_lb; by form_oid LBSRTEST; run;
+
+data alldatapoints_lbtest;
+	merge lb(in=in1) sds_lb(in=in2);
+	by form_oid LBSRTEST;
+	if in1 and in2 ; ***and rav_create_dtm ne .***;
+run;
+
+data alldatapoints; 
+	set alldatapoints_submit alldatapoints_lbtest; 
+	if IsLog="FALSE" then ITEM_GROUP_REPEAT_KEY="0";
+run;
+
+proc sort data=alldatapoints nodupkey; *** to avoid duplicate obs ***;
+		by &item_group_keys ITEM_OID;
+run;
+
+proc sort data=data_in.queries;
+		by &item_group_keys ITEM_OID;
+run;
+
+data data_in.queries;
+	merge data_in.queries(in=in1) alldatapoints(in=in2);
+	by &item_group_keys ITEM_OID;
+	if in1 and in2;
+run;
+*** add to keep active queries from active datapoints END ***;
+
+%macro QUERCT (	bufferdays = ,
+				min_queries_n =,
+				period_days=,
+				querdelrule=,
+				analysis_by_var=);
+
+/*******************************************************************************
+Author: 			Anne-Sophie Gathy
+Creation date:		20-MAR-2017
+
+Notes:
+The dataset containing queries must be tagged as QUERIES.
+
+Parameters:	
+bufferdays = 	No. of days allowed for a site to answer an open query.
+min_queries_n =	Minimum number of queries for a site to be included
+max_queries_n=	Maximum number of queries to be included per site
+querdelrule =	Rule to exclude some queries (WILL BE UPCASED)
+analysis_by_var=entity level at which the analysis will run (cp_region or cp_center)
+*******************************************************************************/
+
+%if %length (&min_queries_n) = 0 %then %do;
+	%put ERROR: min_queries_n is not specified;
+	%goto exit;
+%end;
+%if %length (&period_days) = 0 %then %do;
+	%put ERROR: period_days is not specified;
+	%goto exit;
+%end;
+%if %length (&analysis_by_var) = 0 %then %do;
+	%put ERROR: analysis_by_var is not specified;
+	%goto exit;
+%end;
+%if ((%upcase ("&analysis_by_var") ne "CP_CENTER") and (%upcase ("&analysis_by_var") ne "CP_REGION")) %then %do;
+	%put ERROR: analysis_by_var should be either CP_CENTER or CP_REGION;
+	%goto exit;
+%end;
+
+%let querdelrule = %upcase (%trim (&querdelrule));
+
+
+data querct_keep_queries;
+	set data_in.queries;
+	where (cp_patient is not null);
+	
+	/* Exclude some queries  */
+	if (&querdelrule) then delete;
+	/* If the query is too recent and not yet answered, remove it */
+	if ((QUERY_response_DTM = . and QUERY_closed_DTM = .) and 
+			(datepart (QUERY_OPENED_DTM) >= (&extraction_date. +1- &bufferdays)))
+		then delete;*** UPDATE CJF: shoulbe change into database extraction date ***;
+	      	
+	/* Set the effective answer date: 
+	- if query is closed, choose the reported closed date;
+	- if query isn't closed, choose the DB extraction date */
+	format EFFECTIVE_QUERY_RESPONSE_DTM DATE11.;
+	if QUERY_RESPONSE_DTM ne . then EFFECTIVE_QUERY_RESPONSE_DTM = datepart (QUERY_RESPONSE_DTM);
+	if QUERY_RESPONSE_DTM = . and QUERY_CLOSED_DTM ne . then EFFECTIVE_QUERY_RESPONSE_DTM = datepart (QUERY_CLOSED_DTM);*** UPDATE CJF: shoulbe change into database extraction date ***;
+	if QUERY_RESPONSE_DTM = . and QUERY_CLOSED_DTM = . then EFFECTIVE_QUERY_RESPONSE_DTM = &extraction_date.;*** UPDATE CJF: shoulbe change into database extraction date ***;
+	
+	/* Compute no. days between opening date and the effective answer date */
+	CT_DAYS = EFFECTIVE_QUERY_RESPONSE_DTM - datepart (QUERY_OPENED_DTM)+1;
+	if CT_DAYS < 0 then CT_DAYS = .;
+	if &extraction_date.-EFFECTIVE_QUERY_RESPONSE_DTM+1<=&period_days. or query_status_nm="Open" then output; *** update per KRI update 11JAN2018 CJF ***;			
+run;
+
+/* Identify entities with at least &min_queries_n queries */ 
+proc sql noprint;
+	/* Count the total number of queries per entity */
+	create table queries_count as 
+	select count (*) as queries_count_tot, &analysis_by_var
+	from querct_keep_queries
+	group by &analysis_by_var;
+	
+	/* Select the IDs of entities having at least &min_queries_n */
+	select distinct &analysis_by_var into :ok_entities separated by '" "'
+	from queries_count
+	where queries_count_tot >= &min_queries_n;
+quit;
+
+/* Keep only the last &period_days queries of those sites having at least 
+&min_queries_n queries. */
+proc sort data = querct_keep_queries;
+	by &analysis_by_var descending QUERY_OPENED_DTM ;
+run;
+
+data data_out.output;* (drop = count);
+	set querct_keep_queries (where = (&analysis_by_var in ("&ok_entities")));
+	keep CP_CENTER CP_REGION cp_patient form_oid FORM_REPEAT_KEY item_oid ITEM_GROUP_REPEAT_KEY query_txt query_status_nm query_opened_dtm query_closed_dtm query_response_dtm  
+		EFFECTIVE_QUERY_RESPONSE_DTM maRking_group_nm CT_DAYS instance_nm datapage_nm field_label item_value answer_txt;
+run;
+
+%exit:
+%mend QUERCT;
+
+%QUERCT	(bufferdays = 5,
+		min_queries_n = 10,
+		period_days = 14,
+		querdelrule = QUERY_CANCELLED_DTM ne .
+						or (upcase(QUERY_OPENED_BY) = "systemuser"
+							and upcase(QUERY_TXT) = "The field is required. Please complete."
+						   )  
+					  ,
+		analysis_by_var = cp_center
+		analysis_by_var = cp_region
+); *** analysis_by_var = cp_region for country level analysis ***;
+   
+%macro exp(dataset);
+data data_out.&dataset.;
+	set data_out.output;
+run;
+
+proc export data=data_out.&dataset.
+	outfile="&root./OUTPUT/&dataset..xls" dbms=xls replace;
+run;
+%mend;
+%exp(querct_s_qc);
+%exp(querct_c_qc); 
