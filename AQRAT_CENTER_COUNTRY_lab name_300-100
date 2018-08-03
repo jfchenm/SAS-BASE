@@ -122,6 +122,10 @@ data alldatapoints;
 	if IsLog="FALSE" then ITEM_GROUP_REPEAT_KEY="0";
 run;
 
+proc sort data = alldatapoints; *** change sorting method ***;
+	by &analysis_by_var descending RAV_CREATE_DTM;
+run;
+
 proc sort data=alldatapoints nodupkey; *** to avoid duplicate obs ***;
 		by &item_group_keys ITEM_OID;
 run;
