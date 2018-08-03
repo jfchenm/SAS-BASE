@@ -109,6 +109,10 @@ data alldatapoints;
 	if &extraction_date.-datepart(rav_create_dtm) +1 <=&period_days. then output;
 run;
 
+proc sort data = alldatapoints;
+	by &analysis_by_var descending RAV_CREATE_DTM;
+run;
+
 proc sort data=alldatapoints nodupkey; *** to avoid duplicate obs ***;
 		by &item_group_keys ITEM_OID;
 run;
