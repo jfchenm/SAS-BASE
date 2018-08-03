@@ -209,8 +209,30 @@ run;
 	run;
 %end;
 
+*** chang visit date for triggerred forms START ***;
+proc sql noprint;
+	create table visdat_new as
+	select distinct cp_patient, min(datepart(rav_create_dtm)) as visdat_new  format=date9., DSCONT
+	from data_in.live_ds where form_oid="DS_C_SCR"
+	group by cp_patient
+	order by cp_patient
+	;
+quit;
+
+proc sort data=v2ect_by_form; by cp_patient; run;
+
+data v2ect_by_form_a;
+	merge v2ect_by_form(in=in1) visdat_new(in=in2);
+	by cp_patient;
+	if study_event_oid="00" and form_oid not in ("SV_01" "DM_DOB" "DS_IC_DAT" "IE_NC" "DS_C_SCR") then do;
+		if DSCONT="Yes" then visdat_dtm=visdat_new;
+		else if DSCONT ne "Yes" then flag=1;
+	end;
+	if in1 then output;
+run;
+
 data v2ect_by_form;
-	set v2ect_by_form;
+	set v2ect_by_form_a;
 	/* Compute the no. days between the visit date and the date of 1st data entry of each patient-form.*/
 	V2EDAYS = intck ('day', visdat_dtm, datepart(RAV_CREATE_DTM))+1;
 	/* If the no. days is negative, set it to null */
@@ -220,8 +242,10 @@ data v2ect_by_form;
 			V2EDAYS_NEGYN = "Yes";
 		end;
 	end;
+	if flag=1 then V2EDAYS=.;
 run;
 
+*** chang visit date for triggerred forms END ***;
 
 /* Keep only entities with at least &min_forms_n patient-forms,
 and keep only the last &max_forms_n patient-forms of those entities. */ 
